@@ -1,19 +1,20 @@
 // Group 6 — Combined inputs
 // Tests role+company, role+skills, role+experience, and all-four together.
 //
-// With skills present, covered-skill resolution runs first (CALL 1), then the
-// retrieval paths run in parallel (Promise.all) and their $queryRaw calls
-// interleave in deterministic microtask-FIFO order:
+// All retrieval paths are kicked off concurrently (title tiers included), so
+// the $queryRaw calls interleave in deterministic microtask-FIFO order: the
+// synchronous kickoffs first (title exact, title trigram, company exact), then
+// the awaited chains (title vector after embed; covered skills → skill path):
 //
 // role+company (no skills):
-//   CALL 1 → title exact        CALL 2 → company exact
-//   CALL 3 → title trigram      CALL 4 → title vector ANN
+//   CALL 1 → title exact        CALL 2 → title trigram
+//   CALL 3 → company exact      CALL 4 → title vector ANN
 //   LAST   → final scoring SQL
 //
 // role+skills (no company):
-//   CALL 1 → covered-skill resolution
-//   CALL 2 → title exact        CALL 3 → skill-path candidates
-//   CALL 4 → title trigram      CALL 5 → title vector ANN
+//   CALL 1 → title exact        CALL 2 → title trigram
+//   CALL 3 → title vector ANN   CALL 4 → covered-skill resolution
+//   CALL 5 → skill-path candidates
 //   LAST   → final scoring SQL
 
 import { describe, it, expect, beforeEach, type Mock } from "vitest";
@@ -48,8 +49,8 @@ describe("role + company", () => {
     // maps to roleOrCompanyMatched.
     q()
       .mockResolvedValueOnce([makeMatch("job-1", 1.0)]) // title exact
-      .mockResolvedValueOnce([makeCompanyExact("company-1")]) // company exact
       .mockResolvedValueOnce([]) // title trigram
+      .mockResolvedValueOnce([makeCompanyExact("company-1")]) // company exact
       .mockResolvedValueOnce([]) // title vector
       .mockResolvedValueOnce([
         makeRow({ jobId: "job-1", companyName: "Google", tier: 0 }),
@@ -69,14 +70,15 @@ describe("role + company", () => {
   });
 
   it("makes exactly 5 $queryRaw calls for role+company (exact company match)", async () => {
-    // Exact company short-circuits after call 2. Call sequence:
-    // title-exact, company-exact, title-trigram, title-vector, final = 5 calls.
+    // Exact company hit short-circuits the company trigram fallback. Call
+    // sequence: title-exact, title-trigram, company-exact, title-vector,
+    // final = 5 calls.
     q()
-      .mockResolvedValueOnce([makeMatch("job-1", 1.0)])
-      .mockResolvedValueOnce([makeCompanyExact("company-1")])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([])
-      .mockResolvedValueOnce([makeRow()]);
+      .mockResolvedValueOnce([makeMatch("job-1", 1.0)]) // title exact
+      .mockResolvedValueOnce([]) // title trigram
+      .mockResolvedValueOnce([makeCompanyExact("company-1")]) // company exact
+      .mockResolvedValueOnce([]) // title vector
+      .mockResolvedValueOnce([makeRow()]); // final
 
     await searchJobs({
       roleText: "Engineer",
@@ -93,11 +95,11 @@ describe("role + company", () => {
 describe("role + skills", () => {
   it("resolves covered skills, runs 3 title tiers + skill path + final, and maps coverage through", async () => {
     q()
-      .mockResolvedValueOnce([makeSkillId("skill-react")]) // covered skills
       .mockResolvedValueOnce([makeMatch("job-1", 1.0)]) // title exact
-      .mockResolvedValueOnce([makeSkillJob("job-1")]) // skill-path candidates
       .mockResolvedValueOnce([]) // title trigram
       .mockResolvedValueOnce([]) // title vector
+      .mockResolvedValueOnce([makeSkillId("skill-react")]) // covered skills
+      .mockResolvedValueOnce([makeSkillJob("job-1")]) // skill-path candidates
       .mockResolvedValueOnce([
         makeRow({ covered: 1, required: 2, skillsPct: 50, score: 33 }),
       ]); // final
@@ -142,15 +144,15 @@ describe("role + experience", () => {
 
 describe("all four inputs combined", () => {
   it("makes 7 calls and returns a single ranked result for role+company+skills+experience", async () => {
-    // covered-skills, then title-exact, company-exact, skill-path interleave,
-    // then title-trigram, title-vector, final.
+    // title-exact, title-trigram, company-exact sync; then title-vector,
+    // covered-skills, skill-path, final.
     q()
-      .mockResolvedValueOnce([makeSkillId("skill-react")]) // covered skills
       .mockResolvedValueOnce([makeMatch("job-1", 1.0)]) // title exact
-      .mockResolvedValueOnce([makeCompanyExact("company-1")]) // company exact
-      .mockResolvedValueOnce([makeSkillJob("job-1")]) // skill-path candidates
       .mockResolvedValueOnce([]) // title trigram
+      .mockResolvedValueOnce([makeCompanyExact("company-1")]) // company exact
       .mockResolvedValueOnce([]) // title vector
+      .mockResolvedValueOnce([makeSkillId("skill-react")]) // covered skills
+      .mockResolvedValueOnce([makeSkillJob("job-1")]) // skill-path candidates
       .mockResolvedValueOnce([makeRow({ jobId: "job-1" })]); // final
 
     const result = await searchJobs({

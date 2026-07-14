@@ -78,41 +78,37 @@ async function matchTitleIds(text: string): Promise<string[]> {
   const norm = normalize(text);
   if (!norm) return [];
 
+  // The three tiers are independent — run them concurrently.
+  const [exact, trigram, vector] = await Promise.all([
+    // Tier 1 — exact: case-folded title equality.
+    prisma.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "Job"
+      WHERE lower("jobTitle") = ${norm}
+      LIMIT ${MAX_TITLE_MATCHES_PER_TIER}
+    `,
+    // Tier 2 — trigram: pg_trgm fuzzy match (catches typos/partials). `%` uses the
+    // GIN index; keep only rows above the similarity floor, most similar first.
+    prisma.$queryRaw<{ id: string }[]>`
+      SELECT id FROM "Job"
+      WHERE "jobTitle" % ${text} AND similarity("jobTitle", ${text}) >= ${MIN_TITLE_TRIGRAM_SIMILARITY}
+      ORDER BY similarity("jobTitle", ${text}) DESC
+      LIMIT ${MAX_TITLE_MATCHES_PER_TIER}
+    `,
+    // Tier 3 — vector: semantic ANN (catches synonyms like "SDE" ↔ "Software
+    // Engineer"). `<=>` is cosine distance over the HNSW index; nearest first.
+    embed(text).then((vec) => {
+      const vecLit = toPgVectorLiteral(vec);
+      return prisma.$queryRaw<{ id: string }[]>`
+        SELECT id FROM "Job"
+        WHERE embedding IS NOT NULL
+        ORDER BY embedding <=> ${vecLit}::vector
+        LIMIT ${MAX_TITLE_MATCHES_PER_TIER}
+      `;
+    }),
+  ]);
+
   const ids = new Set<string>();
-  const add = (rows: { id: string }[]) => rows.forEach((r) => ids.add(r.id));
-
-  // Tier 1 — exact: case-folded title equality.
-  add(
-    await prisma.$queryRaw<{ id: string }[]>`
-    SELECT id FROM "Job"
-    WHERE lower("jobTitle") = ${norm}
-    LIMIT ${MAX_TITLE_MATCHES_PER_TIER}
-  `,
-  );
-
-  // Tier 2 — trigram: pg_trgm fuzzy match (catches typos/partials). `%` uses the
-  // GIN index; keep only rows above the similarity floor, most similar first.
-  add(
-    await prisma.$queryRaw<{ id: string }[]>`
-    SELECT id FROM "Job"
-    WHERE "jobTitle" % ${text} AND similarity("jobTitle", ${text}) >= ${MIN_TITLE_TRIGRAM_SIMILARITY}
-    ORDER BY similarity("jobTitle", ${text}) DESC
-    LIMIT ${MAX_TITLE_MATCHES_PER_TIER}
-  `,
-  );
-
-  // Tier 3 — vector: semantic ANN (catches synonyms like "SDE" ↔ "Software
-  // Engineer"). `<=>` is cosine distance over the HNSW index; nearest first.
-  const vecLit = toPgVectorLiteral(await embed(text));
-  add(
-    await prisma.$queryRaw<{ id: string }[]>`
-    SELECT id FROM "Job"
-    WHERE embedding IS NOT NULL
-    ORDER BY embedding <=> ${vecLit}::vector
-    LIMIT ${MAX_TITLE_MATCHES_PER_TIER}
-  `,
-  );
-
+  for (const rows of [exact, trigram, vector]) rows.forEach((r) => ids.add(r.id));
   return [...ids];
 }
 
@@ -272,21 +268,29 @@ async function resolveCoveredSkillIds(skills: SkillQuery[]): Promise<string[]> {
     .map((s) => normalizeSkillToken(s.name))
     .filter(Boolean);
 
+  // Materialized CTEs so each query vector is cast/fetched ONCE, not re-parsed
+  // per catalog row inside the correlated EXISTS. Empty arrays → empty CTEs →
+  // EXISTS is false, so no separate guards are needed.
   const rows = await prisma.$queryRaw<{ id: string }[]>`
+    WITH cand_vecs AS MATERIALIZED (
+      SELECT v::vector AS vec FROM unnest(${vecLits}::text[]) v
+    ),
+    fallback_vecs AS MATERIALIZED (
+      SELECT t.embedding AS vec FROM "Skill" t
+      WHERE t.token = ANY(${glosslessTokens}::text[]) AND t.embedding IS NOT NULL
+    )
     SELECT s.id FROM "Skill" s
     WHERE s.token = ANY(${tokens}::text[])
        OR (
          ${hasVecs} AND s.embedding IS NOT NULL AND EXISTS (
-           SELECT 1 FROM unnest(${vecLits}::text[]) v
-           WHERE (1 - (s.embedding <=> v::vector)) >= ${SEMANTIC_SKILL_MIN}
+           SELECT 1 FROM cand_vecs v
+           WHERE (1 - (s.embedding <=> v.vec)) >= ${SEMANTIC_SKILL_MIN}
          )
        )
        OR (
-         cardinality(${glosslessTokens}::text[]) > 0 AND s.embedding IS NOT NULL AND EXISTS (
-           SELECT 1 FROM "Skill" t
-           WHERE t.token = ANY(${glosslessTokens}::text[])
-             AND t.embedding IS NOT NULL
-             AND (1 - (s.embedding <=> t.embedding)) >= ${SEMANTIC_SKILL_MIN}
+         s.embedding IS NOT NULL AND EXISTS (
+           SELECT 1 FROM fallback_vecs t
+           WHERE (1 - (s.embedding <=> t.vec)) >= ${SEMANTIC_SKILL_MIN}
          )
        )
   `;
@@ -294,8 +298,11 @@ async function resolveCoveredSkillIds(skills: SkillQuery[]): Promise<string[]> {
 }
 
 // Bounded skill-path retrieval: top MAX_SKILL_CANDIDATES jobs having ≥1 covered
-// skill, ordered by coverage ratio. The aggregation-before-LIMIT is intentional —
-// without it the cap would keep arbitrary low-coverage jobs.
+// skill, ordered by coverage ratio. The semi-join narrows to jobs with ≥1
+// covered skill FIRST (via the skillId index), so the coverage-ratio
+// aggregation runs only over qualifying jobs instead of the whole table; the
+// aggregation-before-LIMIT is still intentional — without it the cap would
+// keep arbitrary low-coverage jobs.
 async function matchSkillJobIds(
   coveredSkillIds: string[],
   experienceMinYears: number | null,
@@ -306,13 +313,17 @@ async function matchSkillJobIds(
     SELECT js."jobId"
     FROM "JobSkill" js
     JOIN "Job" j ON j.id = js."jobId"
-    WHERE (${experienceMinYears}::int IS NULL AND ${experienceMaxYears}::int IS NULL)
-       OR (
-         COALESCE(${experienceMinYears}::int, 0) <= COALESCE(j."experienceMaxYears", 99)
-         AND COALESCE(${experienceMaxYears}::int, 99) >= COALESCE(j."experienceMinYears", 0)
-       )
+    WHERE js."jobId" IN (
+        SELECT "jobId" FROM "JobSkill" WHERE "skillId" = ANY(${coveredSkillIds}::text[])
+      )
+      AND (
+        (${experienceMinYears}::int IS NULL AND ${experienceMaxYears}::int IS NULL)
+        OR (
+          COALESCE(${experienceMinYears}::int, 0) <= COALESCE(j."experienceMaxYears", 99)
+          AND COALESCE(${experienceMaxYears}::int, 99) >= COALESCE(j."experienceMinYears", 0)
+        )
+      )
     GROUP BY js."jobId"
-    HAVING COUNT(*) FILTER (WHERE js."skillId" = ANY(${coveredSkillIds}::text[])) > 0
     ORDER BY COUNT(*) FILTER (WHERE js."skillId" = ANY(${coveredSkillIds}::text[]))::float / COUNT(*) DESC
     LIMIT ${MAX_SKILL_CANDIDATES}
   `;
@@ -320,27 +331,43 @@ async function matchSkillJobIds(
 }
 
 // Bounded project-path retrieval: ANN top-K capabilities per project vector
-// (HNSW), unioned and deduped to job ids.
+// (HNSW, one concurrent query per vector), unioned and deduped to job ids.
 async function matchProjectJobIds(projVecLits: string[]): Promise<string[]> {
+  const perVec = await Promise.all(
+    projVecLits.map(
+      (vec) => prisma.$queryRaw<{ jobId: string }[]>`
+        SELECT DISTINCT "jobId" FROM (
+          SELECT "jobId" FROM "JobCapability"
+          WHERE embedding IS NOT NULL
+          ORDER BY embedding <=> ${vec}::vector
+          LIMIT ${MAX_CAPABILITY_MATCHES}
+        ) nearest
+      `,
+    ),
+  );
   const ids = new Set<string>();
-  for (const vec of projVecLits) {
-    const rows = await prisma.$queryRaw<{ jobId: string }[]>`
-      SELECT DISTINCT "jobId" FROM (
-        SELECT "jobId" FROM "JobCapability"
-        WHERE embedding IS NOT NULL
-        ORDER BY embedding <=> ${vec}::vector
-        LIMIT ${MAX_CAPABILITY_MATCHES}
-      ) nearest
-    `;
-    rows.forEach((r) => ids.add(r.jobId));
-  }
+  for (const rows of perVec) rows.forEach((r) => ids.add(r.jobId));
   return [...ids];
+}
+
+// Materialized CTE holding the candidate's project vectors, cast from text
+// literals ONCE per query. The scoring lateral references it per capability
+// row — without this, every 512-dim literal would be re-parsed for every
+// (candidate job × capability × project) combination. Every query embedding
+// scoringLaterals must also embed this CTE.
+function projVecsCte(projVecLits: string[]) {
+  return Prisma.sql`
+    proj_vecs AS MATERIALIZED (
+      SELECT v::vector AS vec FROM unnest(${projVecLits}::text[]) v
+    )
+  `;
 }
 
 // Shared scoring fragment: requiredSkillScore via JobSkill set membership,
 // projectEvidenceScore via AVG of per-capability best project cosine rescaled
 // through the evidence window. Used by both searchJobs and scoreJobMatch so the
-// list and the job page can never disagree.
+// list and the job page can never disagree. Expects a `proj_vecs` CTE
+// (projVecsCte) in the surrounding query.
 function scoringLaterals(coveredSkillIds: string[], projVecLits: string[]) {
   const hasProjVecs = projVecLits.length > 0;
   return Prisma.sql`
@@ -370,8 +397,8 @@ function scoringLaterals(coveredSkillIds: string[], projVecLits: string[]) {
       )::float AS evidence
       FROM (
         SELECT (
-          SELECT MAX((1 - (jc.embedding <=> pv::vector))::float)                 -- <=> is cosine distance; 1 - d = similarity
-          FROM unnest(${projVecLits}::text[]) pv
+          SELECT MAX((1 - (jc.embedding <=> pv.vec))::float)                     -- <=> is cosine distance; 1 - d = similarity
+          FROM proj_vecs pv
         ) AS best
         FROM "JobCapability" jc
         WHERE ${hasProjVecs} AND jc."jobId" = j.id AND jc.embedding IS NOT NULL
@@ -418,18 +445,26 @@ export async function searchJobs(input: SearchInput): Promise<JobCard[]> {
     return [];
   }
 
-  const projVecLits = await Promise.all(
+  // Everything up to the scoring query is independent except for two chains
+  // (project embeds → project path, covered skills → skill path), so the
+  // title/company queries overlap with the Bedrock embeds and skill resolution
+  // instead of waiting behind them.
+  const projVecsPromise = Promise.all(
     projectTexts.map((t) => embed(t).then(toPgVectorLiteral)),
   );
+  const coveredSkillIdsPromise = resolveCoveredSkillIds(skills);
 
-  const coveredSkillIds = await resolveCoveredSkillIds(skills);
-
-  const [titleIds, companyIds, skillJobIds, projectJobIds] = await Promise.all([
-    input.roleText ? matchTitleIds(input.roleText) : Promise.resolve([] as string[]),
-    input.companyText ? matchCompanyIds(input.companyText) : Promise.resolve([] as string[]),
-    matchSkillJobIds(coveredSkillIds, input.experienceMinYears, input.experienceMaxYears),
-    matchProjectJobIds(projVecLits),
-  ]);
+  const [projVecLits, coveredSkillIds, titleIds, companyIds, skillJobIds, projectJobIds] =
+    await Promise.all([
+      projVecsPromise,
+      coveredSkillIdsPromise,
+      input.roleText ? matchTitleIds(input.roleText) : Promise.resolve([] as string[]),
+      input.companyText ? matchCompanyIds(input.companyText) : Promise.resolve([] as string[]),
+      coveredSkillIdsPromise.then((ids) =>
+        matchSkillJobIds(ids, input.experienceMinYears, input.experienceMaxYears),
+      ),
+      projVecsPromise.then(matchProjectJobIds),
+    ]);
 
   if (
     titleIds.length === 0 &&
@@ -449,7 +484,8 @@ export async function searchJobs(input: SearchInput): Promise<JobCard[]> {
   //            min(TIER1_RESERVE, available), rest backfills by score;
   //            score: global top-N by matchScore.
   const rows = await prisma.$queryRaw<ScoreRow[]>`
-    WITH raw AS (
+    WITH ${projVecsCte(projVecLits)},
+    raw AS (
       SELECT
         j.id AS "jobId",
         j."jobTitle",
@@ -558,10 +594,10 @@ export async function scoreJobMatch(
   const hasSkills = skills.length > 0;
   const hasProjVecs = projectTexts.length > 0;
 
-  const projVecLits = await Promise.all(
-    projectTexts.map((t) => embed(t).then(toPgVectorLiteral)),
-  );
-  const coveredSkillIds = await resolveCoveredSkillIds(skills);
+  const [projVecLits, coveredSkillIds] = await Promise.all([
+    Promise.all(projectTexts.map((t) => embed(t).then(toPgVectorLiteral))),
+    resolveCoveredSkillIds(skills),
+  ]);
 
   const rows = await prisma.$queryRaw<
     {
@@ -572,6 +608,7 @@ export async function scoreJobMatch(
       score: number | null;
     }[]
   >`
+    WITH ${projVecsCte(projVecLits)}
     SELECT
       COALESCE(cov.covered, 0) AS covered,
       COALESCE(cov.required, 0) AS required,

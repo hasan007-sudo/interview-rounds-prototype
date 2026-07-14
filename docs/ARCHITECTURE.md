@@ -256,10 +256,12 @@ skill path      = top ~1,000 jobs with ≥1 JobSkill.skillId IN coveredSkillIds,
 
 The skill path is **bounded**: a common skill such as `Python` alone could match
 tens of thousands of jobs, so the shortlist is capped (500–1,000) and ordered by
-coverage ratio before full scoring. The coverage ordering is a GROUP BY over the
-indexed `JobSkill` join with the experience hard filter applied first — this
-aggregation-before-LIMIT is intentional and must not be optimized away, or the
-cap would keep arbitrary low-coverage jobs.
+coverage ratio before full scoring. The candidate set is first narrowed by a
+semi-join to jobs with ≥1 covered skill (via the `JobSkill.skillId` index), then
+the coverage ordering is a GROUP BY over the indexed `JobSkill` join with the
+experience hard filter applied — this aggregation-before-LIMIT is intentional
+and must not be optimized away, or the cap would keep arbitrary low-coverage
+jobs.
 
 Project retrieval uses HNSW ANN over `JobCapability.embedding`, **capped top-K
 per project vector** (like the title tier's top-20 cap) so a permissive
